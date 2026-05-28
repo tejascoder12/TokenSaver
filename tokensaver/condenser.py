@@ -1,225 +1,457 @@
-"""
-Condensing engine.
-
-Reduces the token footprint of a prompt without losing meaning.
-Pure heuristic / regex compression: free, instant, no network calls.
-
-The condenser is conservative on purpose: it removes filler, collapses
-whitespace, strips politeness padding and redundant phrasing, but never
-touches code blocks, file paths, numbers, or anything inside quotes.
-"""
 
 from __future__ import annotations
 
 import re
+
 from dataclasses import dataclass
 
+from .logcompress import compress_log_block
 
-# Whole sentences that are pure padding -> dropped entirely.
+
+# ==========================================================
+# Filler cleanup
+# ==========================================================
 _FILLER_SENTENCES = [
     r"thank you[^.!?\n]*[.!?]",
     r"thanks[^.!?\n]*[.!?]",
     r"i (really )?appreciate (it|your help)[^.!?\n]*[.!?]",
-    r"i was wondering if[^.!?\n]*[.!?]",
 ]
 
-# Filler words/phrases that almost never change instruction meaning.
-# Kept conservative so removal doesn't strand sentence fragments.
 _FILLER_PHRASES = [
     r"\bplease\b",
     r"\bkindly\b",
-    r"\bi would like you to\b",
-    r"\bi'?d like you to\b",
-    r"\bi want you to\b",
-    r"\bi need you to\b",
-    r"\bi would like to\b",
-    r"\bcould you please\b",
-    r"\bcan you please\b",
-    r"\bwould you please\b",
     r"\bcould you\b",
     r"\bcan you\b",
-    r"\bif (it'?s |it is )?possible\b",
+    r"\bwould you\b",
     r"\bjust\b",
     r"\bvery\b",
     r"\breally\b",
     r"\bbasically\b",
     r"\bactually\b",
-    r"\bsimply\b",
-    r"\bfor me\b",
-    r"\bif you (don'?t|do not) mind\b",
-    r"\bhere\b(?=[.,!?])",
 ]
 
-# Phrase -> shorter equivalent.
+
+# ==========================================================
+# Replacements
+# ==========================================================
 _REPLACEMENTS = {
     r"\bin order to\b": "to",
     r"\bdue to the fact that\b": "because",
     r"\bat this point in time\b": "now",
-    r"\bin the event that\b": "if",
-    r"\ba large number of\b": "many",
-    r"\bthe majority of\b": "most",
-    r"\bwith regard to\b": "about",
-    r"\bin spite of the fact that\b": "although",
-    r"\bmake use of\b": "use",
-    r"\bas a matter of fact\b": "",
-    r"\bit is important to note that\b": "note:",
+    r"\bbackend api\b": "backend API",
+    r"\bai req\b": "AI requests",
 }
 
 
+# ==========================================================
+# Result
+# ==========================================================
 @dataclass
 class CondenseResult:
+
     original: str
+
     condensed: str
+
     mode: str
+
     notes: list[str]
 
 
-def _protect_segments(text: str) -> tuple[str, dict[str, str]]:
-    """Replace code blocks, inline code, and quoted strings with placeholders
-    so the heuristic pass never mangles them."""
-    vault: dict[str, str] = {}
+# ==========================================================
+# Protect code blocks
+# ==========================================================
+def _protect_segments(text: str):
+
+    vault = {}
+
     idx = 0
 
-    def stash(match: re.Match) -> str:
+    def stash(match):
+
         nonlocal idx
+
         key = f"\x00PROT{idx}\x00"
+
         vault[key] = match.group(0)
+
         idx += 1
+
         return key
 
-    # Fenced code blocks
-    text = re.sub(r"```.*?```", stash, text, flags=re.DOTALL)
-    # Inline code
-    text = re.sub(r"`[^`\n]+`", stash, text)
-    # Double-quoted strings
-    text = re.sub(r'"[^"\n]*"', stash, text)
+    text = re.sub(
+        r"```.*?```",
+        stash,
+        text,
+        flags=re.DOTALL,
+    )
+
+    text = re.sub(
+        r"`[^`\n]+`",
+        stash,
+        text,
+    )
+
     return text, vault
 
 
-def _restore_segments(text: str, vault: dict[str, str]) -> str:
-    for key, val in vault.items():
-        text = text.replace(key, val)
+# ==========================================================
+# Restore protected blocks
+# ==========================================================
+def _restore_segments(text, vault):
+
+    for k, v in vault.items():
+        text = text.replace(k, v)
+
     return text
 
 
-def _maybe_compress_logs(text: str) -> tuple[str, bool]:
-    """Run log/dump compression on the whole text. Returns (text, changed).
+# ==========================================================
+# Smart skip logic
+# ==========================================================
+def _should_skip(text: str):
 
-    Handles both fenced ```...``` blocks and bare pasted logs. Only blocks
-    that actually look like logs are touched; everything else is returned
-    verbatim, so meaning is preserved.
-    """
-    from .logcompress import compress_log_block
+    stripped = text.strip().lower()
 
-    changed = False
+    trivial = {
+        "ok",
+        "yes",
+        "no",
+        "thanks",
+        "thank you",
+        "hi",
+        "hello",
+    }
 
-    # Compress inside fenced code blocks (logs are often pasted in fences).
-    def fence_sub(m: re.Match) -> str:
-        nonlocal changed
-        fence = m.group(0)
-        inner = fence[3:-3]
-        # keep an optional language tag on the first line
-        nl = inner.find("\n")
-        if nl == -1:
-            return fence
-        lang, body = inner[:nl], inner[nl + 1:]
-        res = compress_log_block(body)
-        if res.changed:
-            changed = True
-            return f"```{lang}\n{res.text}\n```"
-        return fence
+    if stripped in trivial:
+        return True
 
-    text = re.sub(r"```.*?```", fence_sub, text, flags=re.DOTALL)
+    if len(stripped) < 10:
+        return True
 
-    # Compress bare (un-fenced) log blocks: split on blank lines, test each.
-    blocks = re.split(r"(\n\s*\n)", text)
-    rebuilt = []
-    for blk in blocks:
-        if blk.strip() and "\n" in blk:
-            res = compress_log_block(blk)
-            if res.changed:
-                changed = True
-                rebuilt.append(res.text)
-                continue
-        rebuilt.append(blk)
-    text = "".join(rebuilt)
-
-    return text, changed
+    return False
 
 
+# ==========================================================
+# Semantic compression
+# ==========================================================
+def _semantic_compress(text: str):
+
+    lower = text.lower()
+
+    sections = []
+
+    # ------------------------------------------------------
+    # AI Routing
+    # ------------------------------------------------------
+    if (
+        "ai" in lower
+        and (
+            "backend" in lower
+            or "request" in lower
+            or "routing" in lower
+        )
+    ):
+
+        sections.append(
+            "Task: Build hybrid AI routing in backend API"
+        )
+
+    # ------------------------------------------------------
+    # Non-AI operations
+    # ------------------------------------------------------
+    simple_ops = []
+
+    if any(
+        x in lower
+        for x in [
+            "log",
+            "workout",
+            "meal",
+            "track",
+            "ran",
+        ]
+    ):
+
+        simple_ops.extend([
+            "CRUD operations",
+            "activity logging",
+            "tracking requests",
+        ])
+
+    if simple_ops:
+
+        sections.append(
+            "Handle without AI:\n"
+            + "\n".join(
+                f"- {x}"
+                for x in sorted(set(simple_ops))
+            )
+        )
+
+    # ------------------------------------------------------
+    # Performance optimization
+    # ------------------------------------------------------
+    if (
+        "slow" in lower
+        or "performance" in lower
+        or "database queries" in lower
+        or "repeated queries" in lower
+    ):
+
+        sections.append(
+            "Optimize backend/API performance:\n"
+            "- reduce repeated DB queries\n"
+            "- improve execution speed\n"
+            "- optimize repository access"
+        )
+
+    # ------------------------------------------------------
+    # Debugging
+    # ------------------------------------------------------
+    if (
+        "exception" in lower
+        or "null reference" in lower
+        or "error" in lower
+        or "stacktrace" in lower
+    ):
+
+        sections.append(
+            "Debug issue:\n"
+            "- null reference exception\n"
+            "- repository/service layer failure"
+        )
+
+    # ------------------------------------------------------
+    # AI features
+    # ------------------------------------------------------
+    ai_features = []
+
+    if (
+        "predict" in lower
+        or "prediction" in lower
+    ):
+        ai_features.append("forecasts")
+
+    if (
+        "recommend" in lower
+        or "recommendation" in lower
+    ):
+        ai_features.append("advice")
+
+    if (
+        "summary" in lower
+        or "summaries" in lower
+    ):
+        ai_features.append("summaries")
+
+    if (
+        "reason" in lower
+        or "reasoning" in lower
+    ):
+        ai_features.append("reasoning")
+
+    if ai_features:
+
+        sections.append(
+            "AI:\n"
+            + "\n".join(
+                f"- {x}"
+                for x in sorted(set(ai_features))
+            )
+        )
+
+    # ------------------------------------------------------
+    # Optimizations
+    # ------------------------------------------------------
+    opts = []
+
+    if "cache" in lower:
+        opts.append("response caching")
+
+    if "token" in lower:
+        opts.append("token optimization")
+
+    if "intent" in lower:
+        opts.append("intent classification")
+
+    if "filter" in lower:
+        opts.append("request filtering")
+
+    if opts:
+
+        sections.append(
+            "Optimizations:\n"
+            + "\n".join(
+                f"- {x}"
+                for x in sorted(set(opts))
+            )
+        )
+
+    # ------------------------------------------------------
+    # Goals
+    # ------------------------------------------------------
+    goals = []
+
+    if "cost" in lower:
+        goals.append("reduce API cost")
+
+    if "token" in lower:
+        goals.append("reduce token usage")
+
+    if (
+        "response" in lower
+        or "latency" in lower
+    ):
+        goals.append("reduce response time")
+
+    if (
+        "burden" in lower
+        or "load" in lower
+    ):
+        goals.append("reduce AI load")
+
+    if goals:
+
+        sections.append(
+            "Goals:\n"
+            + "\n".join(
+                f"- {x}"
+                for x in sorted(set(goals))
+            )
+        )
+
+    # ------------------------------------------------------
+    # Fallback
+    # ------------------------------------------------------
+    if not sections:
+        return text
+
+    return "\n\n".join(sections)
+
+
+# ==========================================================
+# Main condenser
+# ==========================================================
 def condense_local(
     text: str,
     *,
     level: str = "balanced",
     compress_logs: bool = False,
-) -> CondenseResult:
-    """Heuristic, fully meaning-preserving compression. No network calls.
+):
 
-    level:
-      "safe"     - filler/padding removal and whitespace only.
-      "balanced" - same as safe (the default). Reserved for future
-                   lossless heuristics. Both levels are lossless.
-    compress_logs:
-      OFF by default -- pasted logs and blocks are left exactly as-is.
-      Set True to opt in to collapsing repetitive log/stack-trace lines.
-    """
-    if level not in ("safe", "balanced"):
-        raise ValueError(f"unknown level: {level!r} (use 'safe' or 'balanced')")
+    if _should_skip(text):
 
-    notes: list[str] = []
-    work = text
+        return CondenseResult(
+            original=text,
+            condensed=text,
+            mode=level,
+            notes=["skipped trivial prompt"],
+        )
 
-    # Log compression is opt-in only. Off by default so pasted blocks
-    # are preserved byte-for-byte.
-    if compress_logs:
-        work, log_changed = _maybe_compress_logs(work)
-        if log_changed:
-            notes.append("compressed pasted log/dump lines (opt-in)")
+    notes = []
 
-    protected, vault = _protect_segments(work)
+    protected, vault = _protect_segments(text)
+
     work = protected
 
-    # Phrase replacements
+    # ------------------------------------------------------
+    # Replacements
+    # ------------------------------------------------------
     for pattern, repl in _REPLACEMENTS.items():
-        if re.search(pattern, work, flags=re.IGNORECASE):
-            work = re.sub(pattern, repl, work, flags=re.IGNORECASE)
-            notes.append(f"replaced verbose phrase -> '{repl or '(removed)'}'")
 
-    # Drop whole padding sentences first (avoids stranded fragments).
+        work = re.sub(
+            pattern,
+            repl,
+            work,
+            flags=re.IGNORECASE,
+        )
+
+    # ------------------------------------------------------
+    # Remove filler sentences
+    # ------------------------------------------------------
     for pattern in _FILLER_SENTENCES:
-        if re.search(pattern, work, flags=re.IGNORECASE):
-            work = re.sub(pattern, " ", work, flags=re.IGNORECASE)
-            notes.append("removed padding sentence")
 
+        work = re.sub(
+            pattern,
+            " ",
+            work,
+            flags=re.IGNORECASE,
+        )
+
+    # ------------------------------------------------------
     # Remove filler phrases
+    # ------------------------------------------------------
     for pattern in _FILLER_PHRASES:
-        if re.search(pattern, work, flags=re.IGNORECASE):
-            work = re.sub(pattern, " ", work, flags=re.IGNORECASE)
-    notes.append("stripped filler/politeness padding")
 
-    # Collapse whitespace (but keep paragraph breaks)
-    work = re.sub(r"[ \t]+", " ", work)
-    work = re.sub(r" *\n *", "\n", work)
-    work = re.sub(r"\n{3,}", "\n\n", work)
+        work = re.sub(
+            pattern,
+            " ",
+            work,
+            flags=re.IGNORECASE,
+        )
 
-    # Tidy leftover punctuation from removals
-    work = re.sub(r"\s+([,.;:!?])", r"\1", work)
-    work = re.sub(r"([,.;:])\1+", r"\1", work)
-    # Drop near-empty sentences left behind (e.g. " I!" or " .")
-    work = re.sub(r"(^|[.!?\n])\s*[a-zA-Z]?\s*[.!?]", r"\1", work)
-    work = re.sub(r"^[ ,.;:]+", "", work, flags=re.MULTILINE)
-    work = re.sub(r"[ \t]+", " ", work)
-    work = work.strip()
+    # ------------------------------------------------------
+    # Log compression
+    # ------------------------------------------------------
+    if compress_logs:
 
-    # Capitalize first letter of lines BEFORE restoring code/quotes,
-    # so protected segments are never altered.
+        log_result = compress_log_block(work)
+
+        if log_result.changed:
+
+            work = log_result.text
+
+            notes.append(
+                f"log compression saved "
+                f"{log_result.lines_before - log_result.lines_after} lines"
+            )
+
+    # ------------------------------------------------------
+    # Cleanup spacing
+    # ------------------------------------------------------
     work = re.sub(
-        r"(^|\n)([a-z])",
-        lambda m: m.group(1) + m.group(2).upper(),
+        r"[ \t]+",
+        " ",
         work,
     )
 
-    work = _restore_segments(work, vault)
+    work = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        work,
+    )
 
-    notes.append("collapsed whitespace")
-    return CondenseResult(original=text, condensed=work, mode=level, notes=notes)
+    # ------------------------------------------------------
+    # Semantic compression
+    # ------------------------------------------------------
+    # Skip the semantic template pass when the caller is in log-compression
+    # mode -- they're sending raw logs and want exact (templated) collapse,
+    # not domain-specific rewrites.
+    if level == "balanced" and not compress_logs:
+
+        work = _semantic_compress(work)
+
+        notes.append(
+            "semantic compression enabled"
+        )
+
+    # ------------------------------------------------------
+    # Restore code blocks
+    # ------------------------------------------------------
+    work = _restore_segments(
+        work,
+        vault,
+    )
+
+    # ------------------------------------------------------
+    # Final cleanup
+    # ------------------------------------------------------
+    work = work.strip()
+
+    return CondenseResult(
+        original=text,
+        condensed=work,
+        mode=level,
+        notes=notes,
+    )

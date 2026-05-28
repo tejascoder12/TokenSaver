@@ -131,6 +131,17 @@ def cmd_condense(args) -> int:
 
 def _run_condense(text: str, *, level: str, compress_logs: bool,
                   label: str, auto_clip: bool) -> int:
+    # Strip BOM that PowerShell here-strings inject before stdin content.
+    # Python on Windows reads stdin in cp1252 by default, so the 3-byte
+    # UTF-8 BOM (EF BB BF) arrives as the 3 chars "ï»¿" instead of the
+    # single U+FEFF. Strip both forms so the first line of a log matches
+    # the rest (otherwise duplicate-line collapsing breaks).
+    if text.startswith("﻿"):
+        text = text[1:]
+    if text.startswith("\xef\xbb\xbf"):
+        text = text[3:]
+    if text.startswith("ï»¿"):
+        text = text[3:]
     start = time.perf_counter()
     result = condense_local(text, level=level, compress_logs=compress_logs)
     exec_ms = (time.perf_counter() - start) * 1000.0
@@ -358,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
 # Short-form entry point: `tokensave`.
 #   tokensave                 -> interactive: type/paste, blank line ends
 #   tokensave -c              -> read clipboard, condense, write clipboard
+#   tokensave --compress      -> interactive WITH log compression
+#   tokensave -c --compress   -> clipboard mode WITH log compression
 #   prompt | tokensave        -> condense piped input
 #   tokensave status          -> dashboard
 #   tokensave <anything-else> -> delegate to the full tokensaver parser
@@ -370,6 +383,13 @@ def main_short(argv: list[str] | None = None) -> int:
         while flag in argv:
             argv.remove(flag)
             use_clipboard = True
+
+    # Pull the log-compression flag.
+    compress_logs = False
+    for flag in ("-cl", "--compress", "--compress-logs"):
+        while flag in argv:
+            argv.remove(flag)
+            compress_logs = True
 
     # `status` -> dashboard. (Also accept `stats` for symmetry.)
     if argv and argv[0] in ("status", "stats"):
@@ -390,22 +410,29 @@ def main_short(argv: list[str] | None = None) -> int:
         sys.stderr.write(
             f"tokensave: read {len(text)} chars from clipboard.\n"
         )
-        return _run_condense(text, level="balanced", compress_logs=False,
+        return _run_condense(text, level="balanced",
+                             compress_logs=compress_logs,
                              label="clipboard", auto_clip=True)
 
     # Piped input -> condense the pipe.
     if not argv and not sys.stdin.isatty():
         text = sys.stdin.read()
-        return _run_condense(text, level="balanced", compress_logs=False,
+        return _run_condense(text, level="balanced",
+                             compress_logs=compress_logs,
                              label="", auto_clip=False)
 
     # No args + TTY -> interactive prompt mode.
     if not argv:
+        if compress_logs:
+            sys.stderr.write(
+                "tokensave: log compression is ON for this run.\n"
+            )
         text = _read_interactive()
         if not text.strip():
             sys.stderr.write("tokensave: empty input, nothing to do.\n")
             return 0
-        return _run_condense(text, level="balanced", compress_logs=False,
+        return _run_condense(text, level="balanced",
+                             compress_logs=compress_logs,
                              label="interactive", auto_clip=True)
 
     return main(argv)
