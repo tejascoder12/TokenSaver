@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import time
 
@@ -37,13 +38,101 @@ def _read_stdin() -> str:
     return sys.stdin.read()
 
 
+def _copy_to_clipboard(text: str) -> bool:
+    """Best-effort clipboard copy across platforms. Returns True on success."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["clip"], input=text, text=True,
+                           check=True, timeout=5,
+                           encoding="utf-8", errors="replace")
+            return True
+        if sys.platform == "darwin":
+            subprocess.run(["pbcopy"], input=text, text=True,
+                           check=True, timeout=5)
+            return True
+        for cmd in (["xclip", "-selection", "clipboard"],
+                    ["wl-copy"],
+                    ["xsel", "--clipboard", "--input"]):
+            try:
+                subprocess.run(cmd, input=text, text=True,
+                               check=True, timeout=5)
+                return True
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def _read_clipboard() -> str | None:
+    """Best-effort clipboard read. Returns None if no tool / empty."""
+    try:
+        if sys.platform == "win32":
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"],
+                capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace",
+            )
+            if r.returncode == 0:
+                return r.stdout.rstrip("\r\n")
+            return None
+        if sys.platform == "darwin":
+            r = subprocess.run(["pbpaste"], capture_output=True,
+                               text=True, timeout=5)
+            return r.stdout if r.returncode == 0 else None
+        for cmd in (["xclip", "-selection", "clipboard", "-o"],
+                    ["xsel", "--clipboard", "--output"],
+                    ["wl-paste"]):
+            try:
+                r = subprocess.run(cmd, capture_output=True,
+                                   text=True, timeout=5)
+                if r.returncode == 0:
+                    return r.stdout
+            except FileNotFoundError:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _read_interactive() -> str:
+    """Read a prompt line-by-line. Ends on blank line or EOF (Ctrl+Z+Enter)."""
+    sys.stderr.write(
+        "tokensave: type or paste your prompt below.\n"
+        "  finish with an empty line (press Enter twice)\n"
+        "  or Ctrl+Z then Enter on Windows / Ctrl+D on macOS+Linux.\n"
+        "----------------------------------------------------------\n"
+    )
+    sys.stderr.flush()
+
+    lines: list[str] = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        except KeyboardInterrupt:
+            sys.stderr.write("\ntokensave: cancelled.\n")
+            sys.exit(130)
+        if line == "" and lines:
+            break
+        if line == "" and not lines:
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def cmd_condense(args) -> int:
     text = _read_stdin()
+    return _run_condense(text, level=args.level,
+                         compress_logs=args.compress_logs,
+                         label=args.label or "", auto_clip=False)
+
+
+def _run_condense(text: str, *, level: str, compress_logs: bool,
+                  label: str, auto_clip: bool) -> int:
     start = time.perf_counter()
-
-    result = condense_local(
-        text, level=args.level, compress_logs=args.compress_logs)
-
+    result = condense_local(text, level=level, compress_logs=compress_logs)
     exec_ms = (time.perf_counter() - start) * 1000.0
 
     in_tok = count_tokens(result.original)
@@ -51,12 +140,12 @@ def cmd_condense(args) -> int:
     saved = max(0, in_tok - out_tok)
     cost_saved = estimate_cost(saved, "input")
 
-    # The condensed prompt goes to stdout so it can be piped/copied.
     sys.stdout.write(result.condensed)
     if not result.condensed.endswith("\n"):
         sys.stdout.write("\n")
 
-    # Record it.
+    clipped = _copy_to_clipboard(result.condensed) if auto_clip else False
+
     store = Store.load()
     store.add(Record(
         ts=time.time(),
@@ -67,10 +156,9 @@ def cmd_condense(args) -> int:
         tokens_saved=saved,
         exec_ms=exec_ms,
         cost_saved=cost_saved,
-        label=args.label or "",
+        label=label,
     ))
 
-    # Human-readable summary on stderr so it doesn't pollute piped output.
     pct = (saved / in_tok * 100.0) if in_tok else 0.0
     acc = "" if encoder_is_accurate() else " (estimated)"
     sys.stderr.write(
@@ -78,6 +166,12 @@ def cmd_condense(args) -> int:
         f" | saved {saved} ({pct:.1f}%){acc}"
         f" | ~${cost_saved:.5f} | {exec_ms:.0f} ms [{result.mode}]\n"
     )
+    if auto_clip:
+        sys.stderr.write(
+            "(copied to clipboard — Ctrl+V to paste)\n"
+            if clipped else
+            "(clipboard tool unavailable — output is above)\n"
+        )
     return 0
 
 
@@ -262,23 +356,57 @@ def main(argv: list[str] | None = None) -> int:
 
 
 # Short-form entry point: `tokensave`.
-#   prompt | tokensave           -> condense (default)
-#   tokensave status             -> dashboard
-#   tokensave <anything-else>    -> delegate to the full tokensaver parser
+#   tokensave                 -> interactive: type/paste, blank line ends
+#   tokensave -c              -> read clipboard, condense, write clipboard
+#   prompt | tokensave        -> condense piped input
+#   tokensave status          -> dashboard
+#   tokensave <anything-else> -> delegate to the full tokensaver parser
 def main_short(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
-    # No args + piped input -> condense by default.
-    if not argv and not sys.stdin.isatty():
-        argv = ["condense"]
+    # Pull the clipboard flag out so it works alongside any input mode.
+    use_clipboard = False
+    for flag in ("-c", "--clip", "--clipboard"):
+        while flag in argv:
+            argv.remove(flag)
+            use_clipboard = True
 
     # `status` -> dashboard. (Also accept `stats` for symmetry.)
     if argv and argv[0] in ("status", "stats"):
-        argv = ["stats", *argv[1:]]
+        return main(["stats", *argv[1:]])
 
-    # No args, no pipe -> show the dashboard so the user sees something useful.
+    # Clipboard mode: read clipboard, condense, write back to clipboard.
+    if use_clipboard and not argv:
+        text = _read_clipboard()
+        if text is None:
+            sys.stderr.write(
+                "tokensave: couldn't read the clipboard. "
+                "Copy your prompt first, then run `tokensave -c`.\n"
+            )
+            return 2
+        if not text.strip():
+            sys.stderr.write("tokensave: clipboard is empty, nothing to do.\n")
+            return 0
+        sys.stderr.write(
+            f"tokensave: read {len(text)} chars from clipboard.\n"
+        )
+        return _run_condense(text, level="balanced", compress_logs=False,
+                             label="clipboard", auto_clip=True)
+
+    # Piped input -> condense the pipe.
+    if not argv and not sys.stdin.isatty():
+        text = sys.stdin.read()
+        return _run_condense(text, level="balanced", compress_logs=False,
+                             label="", auto_clip=False)
+
+    # No args + TTY -> interactive prompt mode.
     if not argv:
-        argv = ["stats"]
+        text = _read_interactive()
+        if not text.strip():
+            sys.stderr.write("tokensave: empty input, nothing to do.\n")
+            return 0
+        return _run_condense(text, level="balanced", compress_logs=False,
+                             label="interactive", auto_clip=True)
 
     return main(argv)
 
